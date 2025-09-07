@@ -1,0 +1,268 @@
+// =================================================================
+// SKETCH FINALE: IMMAGINE NASA DEL GIORNO E METEO PALERMO
+// Versione: 1.2
+// Funzionalità:
+// - Download immagine giornaliera dalla NASA.
+// - Centratura automatica dell'immagine sul display.
+// - Download dati meteo da OpenWeatherMap.
+// - Visualizzazione di immagine e meteo su display TFT.
+// =================================================================
+
+// LIBRERIE NECESSARIE:
+// - TFT_eSPI
+// - TJpg_Decoder
+// - ArduinoJson (da installare tramite Library Manager)
+
+// ============== CONFIGURAZIONE WI-FI E API ==============
+#define WIFI_SSID "Wifi here"    // << INSERISCI IL NOME DELLA TUA RETE WIFI
+#define PASSWORD "passowrd here "        // << INSERISCI LA PASSWORD DEL TUO WIFI
+
+const char* OPENWEATHER_API_KEY = "API_OPENWEATHER_HERE";
+const char* NASA_API_KEY = "NASA_API_HERE";
+const char* CITY = "YOUR_CITY";
+const char* IMAGE_FILENAME = "/apod.jpg"; // Nome del file nella memoria flash
+
+// ============== INCLUSIONE LIBRERIE ==============
+#include <TJpg_Decoder.h>
+#include <ArduinoJson.h>
+#include <FS.h>
+#include "SPI.h"
+#include <TFT_eSPI.h>
+
+#ifdef ARDUINO_ARCH_ESP8266
+  #include <ESP8266WiFi.h>
+  #include <ESP8266HTTPClient.h>
+  #include <WiFiClientSecureBearSSL.h>
+#else // Per ESP32
+  #include "SPIFFS.h"
+  #include <WiFi.h>
+  #include <HTTPClient.h>
+#endif
+
+TFT_eSPI tft = TFT_eSPI();
+
+// ============== PROTOTIPI FUNZIONI ==============
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap);
+bool getFile(const char* url, const char* filename);
+String getNasaImageUrl();
+void displayWeather();
+
+// ============== SETUP ==============
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nAvvio Sketch Meteo & Spazio (Finale)");
+
+  if (!SPIFFS.begin()) {
+    Serial.println("Inizializzazione SPIFFS fallita!");
+    while (1) yield();
+  }
+  Serial.println("SPIFFS inizializzato.");
+
+  tft.begin();
+  tft.setRotation(1); // Cambia (0,1,2,3) se l'orientamento è sbagliato
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString("Connessione WiFi...", 20, 20);
+
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(tft_output);
+
+  WiFi.begin(WIFI_SSID, PASSWORD);
+  Serial.print("Connessione in corso...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnesso!");
+  tft.fillScreen(TFT_BLACK);
+  tft.drawString("Connesso!", 20, 20);
+  delay(1000);
+}
+
+// ============== LOOP PRINCIPALE ==============
+void loop() {
+  tft.fillScreen(TFT_BLACK);
+  tft.drawString("Chiedo l'URL alla NASA...", 20, 20);
+  
+  String imageUrl = getNasaImageUrl();
+
+  if (imageUrl.length() == 0) {
+    tft.fillScreen(TFT_RED);
+    tft.drawString("Errore API NASA", 20, 20);
+    delay(10000);
+    return;
+  }
+  
+  tft.fillScreen(TFT_BLACK);
+  tft.drawString("Download immagine...", 20, 20);
+
+  bool loaded_ok = getFile(imageUrl.c_str(), IMAGE_FILENAME);
+
+  if (!loaded_ok) {
+    tft.fillScreen(TFT_RED);
+    tft.drawString("Errore Download", 20, 20);
+    tft.drawString("Controlla Serial Monitor", 20, 40);
+    delay(10000);
+    return;
+  }
+
+  Serial.println("Download completato. Calcolo centratura...");
+
+  // --- Logica per centrare l'immagine ---
+  uint16_t w = 0, h = 0;
+  TJpgDec.getJpgSize(&w, &h, IMAGE_FILENAME);
+  Serial.printf("Dimensioni immagine: %d x %d\n", w, h);
+  Serial.printf("Dimensioni schermo: %d x %d\n", tft.width(), tft.height());
+
+  int16_t x = (tft.width() - w) / 2;
+  int16_t y = (tft.height() - h) / 2;
+  Serial.printf("Coordinate di disegno calcolate: x=%d, y=%d\n", x, y);
+
+  TJpgDec.drawFsJpg(x, y, IMAGE_FILENAME);
+  
+  // --- Mostra il meteo sopra l'immagine ---
+  displayWeather();
+
+  Serial.println("Operazione completata. Riavvia il dispositivo per aggiornare.");
+  while (1) yield();
+}
+
+// ============== FUNZIONI ==============
+
+// Callback per il rendering del JPEG
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  if (y >= tft.height()) return 0;
+  tft.pushImage(x, y, w, h, bitmap);
+  return 1;
+}
+
+// Funzione di download robusta
+bool getFile(const char* url, const char* filename) {
+  Serial.print("Inizio download da: ");
+  Serial.println(url);
+
+  HTTPClient http;
+  
+  #ifdef ARDUINO_ARCH_ESP8266
+    std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+    client->setInsecure(); 
+    if (!http.begin(*client, url)) {
+        Serial.println("ERRORE: Impossibile avviare client HTTP (ESP8266)");
+        return false;
+    }
+  #else // Per ESP32
+    http.begin(url);
+  #endif
+
+  int httpCode = http.GET();
+  if (httpCode <= 0) {
+    Serial.printf("ERRORE: Richiesta GET fallita. Codice: %s\n", http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
+  }
+  
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("ERRORE: Codice HTTP non valido: %d - %s\n", httpCode, http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
+  }
+  
+  File file = SPIFFS.open(filename, "w");
+  if (!file) {
+    Serial.println("ERRORE: Impossibile aprire il file in scrittura su SPIFFS.");
+    http.end();
+    return false;
+  }
+
+  int len = http.writeToStream(&file);
+  file.close();
+  http.end();
+  
+  if (len > 0) {
+    Serial.printf("File salvato con successo (%d bytes).\n", len);
+    return true;
+  } else {
+    Serial.printf("ERRORE: Scrittura su file fallita (codice: %d).\n", len);
+    return false;
+  }
+}
+
+// Ottiene l'URL dell'immagine del giorno dalla NASA
+String getNasaImageUrl() {
+  String imageUrl = "";
+  String nasaApiUrl = "https://api.nasa.gov/planetary/apod?api_key=" + String(NASA_API_KEY);
+  
+  HTTPClient http;
+  #ifdef ARDUINO_ARCH_ESP8266
+    std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+    client->setInsecure();
+    http.begin(*client, nasaApiUrl);
+  #else
+    http.begin(nasaApiUrl);
+  #endif
+
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error) {
+      Serial.println("Fallita l'analisi del JSON della NASA");
+    } else if (strcmp(doc["media_type"], "image") == 0) {
+      imageUrl = doc["url"].as<String>();
+    } else {
+      Serial.println("Il media di oggi non e' un'immagine. Riprova domani.");
+    }
+  } else {
+    Serial.printf("Errore HTTP NASA: %s\n", http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+  return imageUrl;
+}
+
+// Ottiene e visualizza il meteo
+void displayWeather() {
+  String weatherUrl = "http://api.openweathermap.org/data/2.5/weather?q=" + String(CITY) +
+                      "&appid=" + String(OPENWEATHER_API_KEY) + "&units=metric&lang=it";
+
+  HTTPClient http;
+  http.begin(weatherUrl); 
+
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error) {
+      Serial.println("Fallita l'analisi del JSON del meteo");
+      return;
+    }
+
+    float temp = doc["main"]["temp"];
+    String description = doc["weather"][0]["description"];
+    
+    // Correzione per rendere la prima lettera maiuscola
+    description.setCharAt(0, toupper(description.charAt(0)));
+
+    // Disegna una barra nera in basso per la leggibilità del testo
+    tft.fillRect(0, tft.height() - 40, tft.width(), 40, TFT_BLACK); 
+    
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(ML_DATUM); // Allineamento testo: Middle-Left
+    
+    String tempStr = String((int)round(temp)) + " C";
+    tft.setTextSize(2);
+    tft.drawString(tempStr, 10, tft.height() - 20);
+
+    tft.setTextSize(1);
+    tft.drawString(description, tft.width()/2, tft.height() - 20);
+    
+  } else {
+    Serial.printf("Errore HTTP Meteo: %s\n", http.errorToString(httpCode).c_str());
+  }
+  http.end();
+}
